@@ -76,6 +76,10 @@ var path: String = ""
 @export_group("Playback")
 ## If true, decode and play the audio stream.
 @export var enable_audio: bool = true
+## Audio bus used for embedded video audio playback.
+@export var audio_bus: String = "Master": set = set_audio_bus
+## Gain applied to embedded video audio playback.
+@export var volume_db: float = 0.0: set = set_volume_db
 ## If true, slightly adjusts audio speed to keep audio/video in sync.
 @export var audio_speed_to_sync: bool = false
 ## Loop the video when it reaches the end.
@@ -151,6 +155,16 @@ var u_texture: ImageTexture
 var v_texture: ImageTexture
 var a_texture: ImageTexture
 
+func set_audio_bus(value: String) -> void:
+	audio_bus = value
+	if audio_player != null:
+		audio_player.bus = value
+
+func set_volume_db(value: float) -> void:
+	volume_db = value
+	if audio_player != null:
+		audio_player.volume_db = value
+
 func _enter_tree() -> void:
 	var empty_image: Image = Image.create_empty(2, 2, false, Image.FORMAT_R8)
 
@@ -191,6 +205,9 @@ func _enter_tree() -> void:
 		audio_player = AudioStreamPlayer.new()
 		audio_player.name = "AudioPlayer"
 		add_child(audio_player)
+
+	audio_player.bus = audio_bus
+	audio_player.volume_db = volume_db
 
 	if AudioServer.get_bus_index(audio_player.bus) == -1:
 		AudioServer.add_bus()
