@@ -1,7 +1,7 @@
 [gd_scene load_steps=7 format=3 uid="uid://csb7dqgi1qvux"]
 
 [ext_resource type="Script" path="res://addons/mpf-gmc/editor/mpf_panel.gd" id="1_2lqty"]
-[ext_resource type="Texture2D" uid="uid://daqb51yge6uos" path="res://addons/mpf-gmc/icons/PlayScene.svg" id="2_y5774"]
+[ext_resource type="Texture2D" path="res://addons/mpf-gmc/icons/PlayScene.svg" id="2_y5774"]
 
 [sub_resource type="Image" id="Image_ghtnh"]
 data = {

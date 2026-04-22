@@ -141,8 +141,8 @@ func has_local_config_value(section: String, key: String) -> bool:
 func validate_min_version(compare_version: String, min_version: String) -> bool:
 	return _explode_version_string(compare_version) >= _explode_version_string(min_version)
 
-func _explode_version_string(version: String) -> int:
-	var bits = version.split(".")
+func _explode_version_string(version_string: String) -> int:
+	var bits = version_string.split(".")
 	while bits.size() < 4:
 		bits.append("0")
 	bits[3] = bits[3].trim_prefix("dev")

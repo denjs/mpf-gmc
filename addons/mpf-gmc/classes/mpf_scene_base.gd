@@ -15,11 +15,15 @@ var _expirations: Dictionary = {}
 var _updaters: Array[Node] = []
 
 var current_animation: String:
-	get: return self.animation_player.current_animation if self.animation_player else ""
+	get:
+		if self.animation_player:
+			return str(self.animation_player.current_animation)
+		return ""
 var animation_finished:
 	get:
-		@warning_ignore("incompatible_ternary")
-		return self.animation_player.animation_finished if self.animation_player else null
+		if self.animation_player:
+			return self.animation_player.animation_finished
+		return null
 
 ## An AnimationPlayer node containing standard animations.
 ##
@@ -106,7 +110,7 @@ func action_update(settings: Dictionary, kwargs: Dictionary = {}) -> void:
 	for c in self._updaters:
 		c.update(settings, kwargs)
 
-func action_animation(settings: Dictionary, kwargs: Dictionary = {}) -> void:
+func action_animation(settings: Dictionary, _kwargs: Dictionary = {}) -> void:
 	if not self.animation_player:
 		self.log.error("No animation_player property defined. Please attach an AnimationPlayer node.")
 		return
