@@ -7,6 +7,7 @@ var mpf_output
 var mpf_launch
 var mpf_debugger
 var gmc_export
+var mpf_video_player_inspector
 
 func _enter_tree():
 	# Add the new type with a name, a parent type, a script and an icon.
@@ -41,6 +42,9 @@ func _enter_tree():
 	# Add an Export plugin to manage export behavior
 	gmc_export = preload("res://addons/mpf-gmc/editor/mpf_gmc_export.gd").new()
 	add_export_plugin(gmc_export)
+	mpf_video_player_inspector = preload("res://addons/mpf-gmc/editor/mpf_video_player_inspector.gd").new()
+	mpf_video_player_inspector.host_editor_plugin = self
+	add_inspector_plugin(mpf_video_player_inspector)
 
 func _ready():
 	mpf_debugger.attach_panel(mpf_output)
@@ -76,3 +80,4 @@ func _exit_tree():
 	# mpf_debugger.free()
 	remove_export_plugin(gmc_export)
 	# gmc_export.free()
+	remove_inspector_plugin(mpf_video_player_inspector)

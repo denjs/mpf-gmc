@@ -52,6 +52,9 @@ const SHADER_PATH: String = "res://addons/mpf-gmc/yuv_to_rgb.gdshader"
 const PLAYBACK_SPEED_MIN: float = 0.25
 const PLAYBACK_SPEED_MAX: float = 4.0
 const AUDIO_OFFSET_THRESHOLD: float = 0.1
+const AUDIO_SYNC_INTERVAL: float = 1.2
+
+static var _shared_target_audio_bus_refcounts: Dictionary = {}
 
 ## The action to take when this video node (or a parent) is hidden
 @export var hide_behavior: HideBehavior = HideBehavior.RESTART
@@ -82,17 +85,25 @@ var path: String = ""
 @export var volume_db: float = 0.0: set = set_volume_db
 ## If true, slightly adjusts audio speed to keep audio/video in sync.
 @export var audio_speed_to_sync: bool = false
-## Loop the video when it reaches the end.
-@export var loop: bool = false
 ## Playback speed multiplier.
 @export_range(PLAYBACK_SPEED_MIN, PLAYBACK_SPEED_MAX, 0.05, "or_less", "or_greater")
 var playback_speed: float = 1.0: set = set_playback_speed
 ## Preserve original pitch when playback speed changes.
 @export var pitch_adjust: bool = true: set = set_pitch_adjust
 
+@export_group("Playback Range")
+## Time offset in seconds where normal runtime playback should begin.
+@export_range(0.0, 86400.0, 0.001, "or_greater")
+var start_position_seconds: float = 0.0: set = set_start_position_seconds
+## Frame index where normal runtime playback should begin.
+@export var start_frame: int = 0: set = set_start_frame
+## Time offset in seconds where normal runtime playback should stop. Set to -1 to use the full video.
+@export_range(-1.0, 86400.0, 0.001, "or_greater")
+var end_position_seconds: float = -1.0: set = set_end_position_seconds
+## Frame index where normal runtime playback should stop. Set to -1 to use the full video.
+@export var end_frame: int = -1: set = set_end_frame
+
 @export_group("Video")
-## Override playback speed clamp range. Leave at (0, 0) to use default limits.
-@export var playback_speed_override: Vector2 = Vector2.ZERO
 ## Force a specific colour profile, or leave AUTO to use the video metadata.
 @export var color_profile: ColorProfile = ColorProfile.AUTO: set = _set_color_profile
 
@@ -134,6 +145,7 @@ var subtitle_streams: PackedInt32Array = []
 var chapters: Array[Chapter] = []
 
 var _time_elapsed: float = 0.0
+var _audio_sync_elapsed: float = 0.0
 var _frame_time: float = 0.0
 var _skips: int = 0
 
@@ -149,24 +161,246 @@ var _shader_material: ShaderMaterial = null
 var _video_thread: int = -1
 var _audio_pitch_effect: AudioEffectPitchShift = AudioEffectPitchShift.new()
 var _editor_refresh_queued: bool = false
+var _player_audio_bus_name: String = ""
+var _created_target_audio_bus_name: String = ""
+var _empty_texture_image: Image = null
+var _syncing_range_properties: bool = false
+var _start_range_prefers_frames: bool = false
+var _end_range_prefers_frames: bool = false
 
 var y_texture: ImageTexture
 var u_texture: ImageTexture
 var v_texture: ImageTexture
 var a_texture: ImageTexture
 
+func _get_available_audio_bus_names() -> PackedStringArray:
+	var bus_names: PackedStringArray = PackedStringArray()
+	for bus_index: int in range(AudioServer.bus_count):
+		bus_names.append(AudioServer.get_bus_name(bus_index))
+
+	if bus_names.is_empty():
+		bus_names.append("Master")
+
+	return bus_names
+
+func _validate_property(property: Dictionary) -> void:
+	if property.name == "audio_bus":
+		property.hint = PROPERTY_HINT_ENUM
+		property.hint_string = ",".join(_get_available_audio_bus_names())
+	elif property.name == "start_position_seconds" or property.name == "end_position_seconds":
+		var max_duration: float = maxf(get_video_length_float() if _frame_rate > 0.0 else 0.0, 0.0)
+		var min_value: float = -1.0 if property.name == "end_position_seconds" else 0.0
+		property.hint = PROPERTY_HINT_RANGE
+		property.hint_string = "%s,%s,0.001" % [str(min_value), str(max_duration)]
+	elif property.name == "start_frame" or property.name == "end_frame":
+		var max_frame: int = maxi(_frame_count - 1, 0)
+		var min_frame: int = -1 if property.name == "end_frame" else 0
+		property.hint = PROPERTY_HINT_RANGE
+		property.hint_string = "%s,%s,1" % [str(min_frame), str(max_frame)]
+
+func set_start_position_seconds(value: float) -> void:
+	start_position_seconds = maxf(value, 0.0)
+	_start_range_prefers_frames = false
+	_sync_playback_range_from_seconds(true)
+
+func set_start_frame(value: int) -> void:
+	start_frame = maxi(value, 0)
+	_start_range_prefers_frames = true
+	_sync_playback_range_from_frames(true)
+
+func set_end_position_seconds(value: float) -> void:
+	end_position_seconds = value if value < 0.0 else maxf(value, 0.0)
+	_end_range_prefers_frames = false
+	_sync_playback_range_from_seconds(false)
+
+func set_end_frame(value: int) -> void:
+	end_frame = value if value < 0 else maxi(value, 0)
+	_end_range_prefers_frames = true
+	_sync_playback_range_from_frames(false)
+
 func set_audio_bus(value: String) -> void:
 	audio_bus = value
 	if audio_player != null:
-		audio_player.bus = value
+		_ensure_audio_bus(value)
 
 func set_volume_db(value: float) -> void:
 	volume_db = value
 	if audio_player != null:
 		audio_player.volume_db = value
 
+func _ensure_audio_bus(bus_name: String) -> void:
+	if bus_name == "":
+		bus_name = "Master"
+
+	if Engine.is_editor_hint():
+		audio_player.bus = bus_name if AudioServer.get_bus_index(bus_name) != -1 else "Master"
+		return
+
+	if _created_target_audio_bus_name != "" and _created_target_audio_bus_name != bus_name:
+		_release_created_target_audio_bus()
+
+	if AudioServer.get_bus_index(bus_name) == -1:
+		AudioServer.add_bus()
+		var bus_index: int = AudioServer.bus_count - 1
+		AudioServer.set_bus_name(bus_index, bus_name)
+		_created_target_audio_bus_name = bus_name
+		_shared_target_audio_bus_refcounts[bus_name] = int(_shared_target_audio_bus_refcounts.get(bus_name, 0)) + 1
+	elif _created_target_audio_bus_name == "" and _shared_target_audio_bus_refcounts.has(bus_name):
+		_created_target_audio_bus_name = bus_name
+		_shared_target_audio_bus_refcounts[bus_name] = int(_shared_target_audio_bus_refcounts.get(bus_name, 0)) + 1
+
+	if _player_audio_bus_name == "":
+		_player_audio_bus_name = "__mpf_video_player_%s" % get_instance_id()
+		if AudioServer.get_bus_index(_player_audio_bus_name) == -1:
+			AudioServer.add_bus()
+			var player_bus_index: int = AudioServer.bus_count - 1
+			AudioServer.set_bus_name(player_bus_index, _player_audio_bus_name)
+			AudioServer.add_bus_effect(player_bus_index, _audio_pitch_effect)
+
+	var target_bus_index: int = AudioServer.get_bus_index(bus_name)
+	var player_bus_index: int = AudioServer.get_bus_index(_player_audio_bus_name)
+	if player_bus_index != -1:
+		AudioServer.set_bus_send(player_bus_index, AudioServer.get_bus_name(target_bus_index))
+		audio_player.bus = _player_audio_bus_name
+
+func _release_created_audio_bus() -> void:
+	if _player_audio_bus_name != "":
+		var player_bus_index: int = AudioServer.get_bus_index(_player_audio_bus_name)
+		if player_bus_index > 0 and player_bus_index < AudioServer.bus_count:
+			AudioServer.remove_bus(player_bus_index)
+		_player_audio_bus_name = ""
+
+	_release_created_target_audio_bus()
+
+func _release_created_target_audio_bus() -> void:
+	if _created_target_audio_bus_name == "":
+		return
+
+	var remaining_refs: int = int(_shared_target_audio_bus_refcounts.get(_created_target_audio_bus_name, 0)) - 1
+	if remaining_refs > 0:
+		_shared_target_audio_bus_refcounts[_created_target_audio_bus_name] = remaining_refs
+	else:
+		_shared_target_audio_bus_refcounts.erase(_created_target_audio_bus_name)
+		var bus_index: int = AudioServer.get_bus_index(_created_target_audio_bus_name)
+		if bus_index > 0 and bus_index < AudioServer.bus_count:
+			AudioServer.remove_bus(bus_index)
+	_created_target_audio_bus_name = ""
+
+func _wait_for_video_task_completion() -> void:
+	if _video_thread == -1:
+		return
+
+	var error: int = WorkerThreadPool.wait_for_task_completion(_video_thread)
+	if error != OK:
+		printerr("Something went wrong waiting for task completion! %s" % error)
+	_video_thread = -1
+
+func _sync_playback_range_from_seconds(is_start: bool) -> void:
+	if _syncing_range_properties:
+		return
+	if _frame_rate <= 0.0:
+		_seek_editor_preview_to_range_endpoint(is_start)
+		return
+
+	_syncing_range_properties = true
+	if is_start:
+		start_frame = int(round(start_position_seconds * _frame_rate))
+	else:
+		end_frame = -1 if end_position_seconds < 0.0 else int(round(end_position_seconds * _frame_rate))
+	_normalize_playback_range()
+	_syncing_range_properties = false
+	_seek_editor_preview_to_range_endpoint(is_start)
+
+func _sync_playback_range_from_frames(is_start: bool) -> void:
+	if _syncing_range_properties:
+		return
+	if _frame_rate <= 0.0:
+		_seek_editor_preview_to_range_endpoint(is_start)
+		return
+
+	_syncing_range_properties = true
+	if is_start:
+		start_position_seconds = start_frame / _frame_rate
+	else:
+		end_position_seconds = -1.0 if end_frame < 0 else end_frame / _frame_rate
+	_normalize_playback_range()
+	_syncing_range_properties = false
+	_seek_editor_preview_to_range_endpoint(is_start)
+
+func _sync_playback_range_after_video_load() -> void:
+	if _frame_rate <= 0.0:
+		return
+
+	_syncing_range_properties = true
+	if _start_range_prefers_frames:
+		start_position_seconds = start_frame / _frame_rate
+	else:
+		start_frame = int(round(start_position_seconds * _frame_rate))
+
+	if _end_range_prefers_frames:
+		end_position_seconds = -1.0 if end_frame < 0 else end_frame / _frame_rate
+	else:
+		end_frame = -1 if end_position_seconds < 0.0 else int(round(end_position_seconds * _frame_rate))
+	_normalize_playback_range()
+	_syncing_range_properties = false
+
+func _seek_editor_preview_to_range_endpoint(is_start: bool) -> void:
+	if not Engine.is_editor_hint() or not preview_in_editor or path == "":
+		return
+	if not is_inside_tree() or not is_node_ready():
+		return
+	if not _ensure_editor_preview_video():
+		return
+
+	var target_frame: int = _get_configured_start_frame() if is_start else _get_configured_end_frame()
+	pause()
+	seek_frame(target_frame)
+
+func _normalize_playback_range() -> void:
+	if _frame_rate <= 0.0:
+		return
+
+	start_frame = maxi(start_frame, 0)
+	start_position_seconds = start_frame / _frame_rate
+
+	if end_frame >= 0 and end_frame < start_frame:
+		end_frame = start_frame
+		end_position_seconds = end_frame / _frame_rate
+
+func _get_configured_start_frame() -> int:
+	if _frame_rate <= 0.0:
+		return maxi(start_frame, 0)
+	return clampi(int(round(start_position_seconds * _frame_rate)), 0, maxi(_frame_count - 1, 0))
+
+func _has_configured_end_frame() -> bool:
+	return end_position_seconds >= 0.0 or end_frame >= 0
+
+func _get_configured_end_frame() -> int:
+	var last_frame_index: int = maxi(_frame_count - 1, 0)
+	if not _has_configured_end_frame():
+		return last_frame_index
+	if _frame_rate <= 0.0:
+		return clampi(end_frame, 0, last_frame_index) if end_frame >= 0 else last_frame_index
+	return clampi(int(round(end_position_seconds * _frame_rate)), 0, last_frame_index)
+
+func _get_effective_runtime_end_frame() -> int:
+	return min(_get_configured_end_frame(), maxi(_frame_count - 1, 0))
+
+func set_start_from_current_preview() -> void:
+	if not _ensure_editor_preview_video():
+		return
+	set("start_frame", current_frame)
+	notify_property_list_changed()
+
+func set_end_from_current_preview() -> void:
+	if not _ensure_editor_preview_video():
+		return
+	set("end_frame", current_frame)
+	notify_property_list_changed()
+
 func _enter_tree() -> void:
 	var empty_image: Image = Image.create_empty(2, 2, false, Image.FORMAT_R8)
+	_empty_texture_image = empty_image
 
 	y_texture = ImageTexture.create_from_image(empty_image)
 	u_texture = ImageTexture.create_from_image(empty_image)
@@ -208,11 +442,7 @@ func _enter_tree() -> void:
 
 	audio_player.bus = audio_bus
 	audio_player.volume_db = volume_db
-
-	if AudioServer.get_bus_index(audio_player.bus) == -1:
-		AudioServer.add_bus()
-		audio_player.bus = AudioServer.get_bus_name(AudioServer.bus_count - 1)
-		AudioServer.add_bus_effect(AudioServer.bus_count - 1, _audio_pitch_effect)
+	_ensure_audio_bus(audio_bus)
 
 	if debug and OS.get_name().to_lower() != "web":
 		_print_system_debug()
@@ -226,19 +456,12 @@ func _enter_tree() -> void:
 		stop()
 
 func _exit_tree() -> void:
-	if _video_thread != -1:
-		var error: int = WorkerThreadPool.wait_for_task_completion(_video_thread)
-		if error != OK:
-			printerr("Something went wrong waiting for task completion! %s" % error)
-		_video_thread = -1
+	_wait_for_video_task_completion()
 
 	if video != null:
 		close()
 
-	if audio_player != null:
-		var bus_index := AudioServer.get_bus_index(audio_player.bus)
-		if bus_index > 0 and bus_index < AudioServer.bus_count:
-			AudioServer.remove_bus(bus_index)
+	_release_created_audio_bus()
 
 func _ready() -> void:
 	playback_ready.emit()
@@ -265,8 +488,10 @@ func _notification(what: int) -> void:
 
 func _process(delta: float) -> void:
 	if _is_playing:
+		var playback_end_frame: int = _get_effective_runtime_end_frame()
 		_skips = 1
 		_time_elapsed += delta
+		_audio_sync_elapsed += delta
 		if _time_elapsed < _frame_time:
 			return
 
@@ -277,18 +502,16 @@ func _process(delta: float) -> void:
 		_time_elapsed -= _skips * _frame_time
 		current_frame += _skips
 
-		if current_frame >= _frame_count:
+		if current_frame >= _frame_count or current_frame > playback_end_frame:
 			_is_playing = false
 			if enable_audio and audio_player.stream != null:
 				audio_player.set_stream_paused(true)
 
 			video_ended.emit()
-			if loop:
-				seek_frame(0)
-				play()
 		else:
-			if enable_audio and audio_player.stream != null:
+			if enable_audio and audio_player.stream != null and _audio_sync_elapsed >= AUDIO_SYNC_INTERVAL:
 				_sync_audio_video()
+				_audio_sync_elapsed = 0.0
 
 			if _skips > _frame_rate:
 				seek_frame(current_frame)
@@ -298,11 +521,7 @@ func _process(delta: float) -> void:
 					_skips -= 1
 				next_frame()
 	elif _video_thread != -1:
-		var error: int = WorkerThreadPool.wait_for_task_completion(_video_thread)
-		if error != OK:
-			printerr("Something went wrong waiting for task completion! %s" % error)
-
-		_video_thread = -1
+		_wait_for_video_task_completion()
 		_update_video(video)
 
 		if autoplay:
@@ -387,6 +606,8 @@ func _get_mpf_parent() -> Node:
 	return null
 
 func set_video_path(new_path: String) -> void:
+	_wait_for_video_task_completion()
+
 	if video != null:
 		close()
 
@@ -418,7 +639,7 @@ func set_video_path(new_path: String) -> void:
 	else:
 		video.disable_debug()
 
-	_video_thread = WorkerThreadPool.add_task(_open_video)
+	_video_thread = WorkerThreadPool.add_task(_open_video.bind(video, path))
 
 	if enable_audio:
 		_open_audio()
@@ -446,6 +667,8 @@ func _update_video(new_video: GoZenVideo) -> void:
 
 	_is_playing = false
 	current_frame = 0
+	_time_elapsed = 0.0
+	_audio_sync_elapsed = 0.0
 
 	_padding = video.get_padding()
 	_rotation = video.get_rotation()
@@ -453,6 +676,7 @@ func _update_video(new_video: GoZenVideo) -> void:
 	_resolution = video.get_resolution()
 	_frame_count = video.get_frame_count()
 	_has_alpha = video.get_has_alpha()
+	_sync_playback_range_after_video_load()
 
 	video_streams = video.get_streams(StreamType.VIDEO)
 	audio_streams = video.get_streams(StreamType.AUDIO)
@@ -478,6 +702,9 @@ func _update_video(new_video: GoZenVideo) -> void:
 	if debug:
 		_print_video_debug()
 
+	if video_texture == null or video_texture.texture == null:
+		return
+
 	@warning_ignore("UNSAFE_METHOD_ACCESS")
 	video_texture.texture.set_image(image)
 
@@ -498,7 +725,33 @@ func _update_video(new_video: GoZenVideo) -> void:
 	_shader_material.set_shader_parameter("a_data", a_texture)
 
 	set_playback_speed(playback_speed)
+	if _frame_count > 0:
+		seek_frame(_get_configured_start_frame())
 	video_loaded.emit()
+
+func _get_audio_playback_position() -> float:
+	if _frame_rate <= 0.0:
+		return 0.0
+	return current_frame / _frame_rate
+
+func _clear_video_frame() -> void:
+	if _empty_texture_image == null:
+		_empty_texture_image = Image.create_empty(2, 2, false, Image.FORMAT_R8)
+
+	_empty_texture_image.fill(Color.WHITE)
+
+	if video_texture != null and video_texture.texture != null:
+		@warning_ignore("UNSAFE_METHOD_ACCESS")
+		video_texture.texture.set_image(_empty_texture_image)
+
+	if y_texture != null:
+		y_texture.set_image(_empty_texture_image)
+	if u_texture != null:
+		u_texture.set_image(_empty_texture_image)
+	if v_texture != null:
+		v_texture.set_image(_empty_texture_image)
+	if a_texture != null:
+		a_texture.set_image(_empty_texture_image)
 
 func _set_color_profile(new_profile: ColorProfile = color_profile) -> void:
 	if _shader_material == null:
@@ -530,16 +783,24 @@ func seek_frame(new_frame_nr: int) -> void:
 	if not is_open() and new_frame_nr == current_frame:
 		return
 
-	current_frame = clamp(new_frame_nr, 0, _frame_count)
+	var max_frame_index: int = maxi(_frame_count - 1, 0)
+	current_frame = clamp(new_frame_nr, 0, max_frame_index)
 	if video.seek_frame(current_frame):
 		printerr("Couldn't seek frame!")
 	else:
 		_set_frame_image()
 
-	if enable_audio and audio_player.stream and audio_player.stream.get_length() != 0:
+	if (
+		enable_audio
+		and audio_player != null
+		and audio_player.is_inside_tree()
+		and audio_player.stream
+		and audio_player.stream.get_length() != 0
+	):
 		audio_player.set_stream_paused(false)
-		audio_player.play(current_frame / _frame_rate)
+		audio_player.play(_get_audio_playback_position())
 		audio_player.set_stream_paused(not _is_playing)
+		_audio_sync_elapsed = 0.0
 
 func next_frame(skip: bool = false) -> void:
 	if video.next_frame(skip) and not skip:
@@ -549,34 +810,49 @@ func next_frame(skip: bool = false) -> void:
 		print("Something went wrong getting next frame!")
 
 func close() -> void:
-	if video != null:
-		if _is_playing:
-			pause()
-		video = null
+	if _is_playing:
+		pause()
+
+	video = null
+	audio_player.stream = null
+	current_frame = 0
+	_time_elapsed = 0.0
+	_audio_sync_elapsed = 0.0
+	_frame_time = 0.0
+	_frame_rate = 0.0
+	_frame_count = 0
+	_padding = 0
+	_rotation = 0
+	_resolution = Vector2i.ZERO
+	_has_alpha = false
+	video_streams = PackedInt32Array()
+	audio_streams = PackedInt32Array()
+	subtitle_streams = PackedInt32Array()
+	chapters.clear()
+	_clear_video_frame()
 
 func play() -> void:
 	if Engine.is_editor_hint():
 		if path == "" or not FileAccess.file_exists(path):
 			return
+		if not is_inside_tree() or not is_node_ready():
+			return
 
-		if video == null:
-			video = GoZenVideo.new()
-			if debug:
-				video.enable_debug()
-			else:
-				video.disable_debug()
-
-			if video.open(path):
-				printerr("Error opening video in editor preview!")
-				video = null
-				return
-
-			_update_video(video)
-
-		if not is_open():
+		if not _ensure_editor_preview_video():
 			return
 
 		_is_playing = true
+		_audio_sync_elapsed = 0.0
+		if (
+			enable_audio
+			and audio_player != null
+			and audio_player.is_inside_tree()
+			and audio_player.stream
+			and audio_player.stream.get_length() != 0
+		):
+			audio_player.set_stream_paused(false)
+			audio_player.play(_get_audio_playback_position())
+			audio_player.set_stream_paused(not _is_playing)
 		return
 
 	if not is_open():
@@ -585,17 +861,24 @@ func play() -> void:
 	if _is_playing:
 		return
 
+	var playback_start_frame: int = _get_configured_start_frame()
+	var playback_end_frame: int = _get_effective_runtime_end_frame()
+	if current_frame < playback_start_frame or current_frame > playback_end_frame:
+		seek_frame(playback_start_frame)
+
 	_is_playing = true
+	_audio_sync_elapsed = 0.0
 
 	if enable_audio and audio_player.stream and audio_player.stream.get_length() != 0:
 		audio_player.set_stream_paused(false)
-		audio_player.play((current_frame + 1) / _frame_rate)
+		audio_player.play(_get_audio_playback_position())
 		audio_player.set_stream_paused(not _is_playing)
 
 	playback_started.emit()
 
 func pause() -> void:
 	_is_playing = false
+	_audio_sync_elapsed = 0.0
 	if enable_audio and audio_player.stream != null:
 		audio_player.set_stream_paused(true)
 	playback_paused.emit()
@@ -603,17 +886,17 @@ func pause() -> void:
 func stop() -> void:
 	pause()
 	if is_open():
-		seek_frame(0)
+		seek_frame(_get_configured_start_frame())
 
 func is_playing() -> bool:
 	return _is_playing
 
 func _sync_audio_video() -> void:
-	if _time_elapsed < 1.20:
+	if _frame_rate <= 0.0:
 		return
 
 	if enable_audio and audio_player.stream and audio_player.stream.get_length() != 0:
-		var expected_time: float = (current_frame + 1) / _frame_rate
+		var expected_time: float = _get_audio_playback_position()
 		var actual_time: float = audio_player.get_playback_position() + AudioServer.get_time_since_last_mix()
 		var audio_offset: float = actual_time - expected_time
 
@@ -645,15 +928,23 @@ func get_video_framerate() -> float:
 	return _frame_rate
 
 func get_video_length() -> int:
+	if _frame_rate <= 0.0:
+		return 0
 	return int(_frame_count / _frame_rate)
 
 func get_video_length_float() -> float:
+	if _frame_rate <= 0.0:
+		return 0.0
 	return _frame_count / _frame_rate
 
 func get_current_playback_position() -> int:
+	if _frame_rate <= 0.0:
+		return 0
 	return int(current_frame / _frame_rate)
 
 func get_current_playback_position_float() -> float:
+	if _frame_rate <= 0.0:
+		return 0.0
 	return current_frame / _frame_rate
 
 func get_video_rotation() -> int:
@@ -682,26 +973,26 @@ func _set_current_frame(new_current_frame: int) -> void:
 	frame_changed.emit(current_frame)
 
 func _set_frame_image() -> void:
+	if video == null or y_texture == null or u_texture == null or v_texture == null:
+		return
+
 	RenderingServer.texture_2d_update(y_texture.get_rid(), video.get_y_data(), 0)
 	RenderingServer.texture_2d_update(u_texture.get_rid(), video.get_u_data(), 0)
 	RenderingServer.texture_2d_update(v_texture.get_rid(), video.get_v_data(), 0)
-	if _has_alpha:
+	if _has_alpha and a_texture != null:
 		RenderingServer.texture_2d_update(a_texture.get_rid(), video.get_a_data(), 0)
 
 func set_playback_speed(new_playback_value: float) -> void:
-	if playback_speed_override == Vector2.ZERO:
-		playback_speed = clampf(new_playback_value, 0.5, 2.0)
-	else:
-		playback_speed = clampf(new_playback_value, playback_speed_override.x, playback_speed_override.y)
+	playback_speed = clampf(new_playback_value, PLAYBACK_SPEED_MIN, PLAYBACK_SPEED_MAX)
 
 	if _frame_rate > 0.0:
 		_frame_time = (1.0 / _frame_rate) / playback_speed
 
-	if enable_audio and audio_player.stream != null:
+	if enable_audio and audio_player != null and audio_player.stream != null:
 		audio_player.pitch_scale = playback_speed
 		_set_pitch_adjust()
-		if _is_playing and _frame_rate > 0.0:
-			audio_player.play(current_frame * (1.0 / _frame_rate))
+		if _is_playing and _frame_rate > 0.0 and audio_player.is_inside_tree():
+			audio_player.play(_get_audio_playback_position())
 
 func set_pitch_adjust(new_pitch_value: bool) -> void:
 	pitch_adjust = new_pitch_value
@@ -724,10 +1015,17 @@ func set_audio_stream(stream: int) -> void:
 
 	if enable_audio:
 		_open_audio(stream)
-		if _is_playing and audio_player.stream and audio_player.stream.get_length() != 0:
+		if (
+			_is_playing
+			and audio_player != null
+			and audio_player.is_inside_tree()
+			and audio_player.stream
+			and audio_player.stream.get_length() != 0
+		):
 			audio_player.set_stream_paused(false)
-			audio_player.play(current_frame / _frame_rate)
+			audio_player.play(_get_audio_playback_position())
 			audio_player.set_stream_paused(not _is_playing)
+			_audio_sync_elapsed = 0.0
 
 func duration_to_formatted_string(duration_in_seconds: float) -> String:
 	var hours: int = floori(duration_in_seconds / 3600.0)
@@ -738,8 +1036,8 @@ func duration_to_formatted_string(duration_in_seconds: float) -> String:
 		return "%02d:%02d" % [minutes, seconds]
 	return "%02d:%02d:%02d" % [hours, minutes, seconds]
 
-func _open_video() -> void:
-	if video.open(path):
+func _open_video(video_instance: GoZenVideo, video_path: String) -> void:
+	if video_instance.open(video_path):
 		printerr("Error opening video!")
 
 func _open_audio(stream_id: int = -1) -> void:
@@ -755,10 +1053,37 @@ func _refresh_editor_preview() -> void:
 	if not Engine.is_editor_hint():
 		return
 	if _editor_refresh_queued:
-			return
+		return
 
 	_editor_refresh_queued = true
 	call_deferred("_refresh_editor_preview_deferred")
+
+func _ensure_editor_preview_video() -> bool:
+	if not is_inside_tree() or not is_node_ready():
+		return false
+	if video_texture == null or video_texture.texture == null:
+		return false
+	if y_texture == null or u_texture == null or v_texture == null or a_texture == null:
+		return false
+
+	if video == null:
+		video = GoZenVideo.new()
+		if debug:
+			video.enable_debug()
+		else:
+			video.disable_debug()
+
+		if video.open(path):
+			printerr("Error opening video in editor preview!")
+			video = null
+			return false
+
+		_update_video(video)
+
+	if enable_audio and audio_player.stream == null:
+		_open_audio()
+
+	return is_open()
 
 func _refresh_editor_preview_deferred() -> void:
 	_editor_refresh_queued = false
@@ -783,24 +1108,9 @@ func _refresh_editor_preview_deferred() -> void:
 		push_warning("Preview video not found: %s" % path)
 		return
 
-	if video == null:
-		video = GoZenVideo.new()
-		if debug:
-			video.enable_debug()
-		else:
-			video.disable_debug()
-
-		if video.open(path):
-			printerr("Error opening video in editor preview!")
-			video = null
-			return
-
-		_update_video(video)
-
-	if is_open():
+	if _ensure_editor_preview_video():
 		pause()
-		seek_frame(0)
-		play()
+		seek_frame(_get_configured_start_frame())
 
 func _print_stream_info(streams: PackedInt32Array) -> void:
 	for i: int in range(len(streams)):
