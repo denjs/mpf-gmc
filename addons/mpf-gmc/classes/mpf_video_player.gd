@@ -62,6 +62,8 @@ static var _shared_target_audio_bus_refcounts: Dictionary = {}
 @export var end_behavior: EndBehavior = EndBehavior.NOTHING
 ## An event (or comma-separated list of events) to be posted to MPF when the video finishes.
 @export var events_when_stopped: String = ""
+## Sends finish events slightly before the final frame so MPF can prepare the next item before playback visibly stops.
+@export_range(0.0, 2.0, 0.01, "suffix:s") var events_when_stopped_lead_time: float = 0.0
 ## The name of the method to call when the video finishes when end behaviour is a method.
 @export var end_method: String = ""
 ## Ducking Settings
@@ -85,6 +87,8 @@ var path: String = ""
 @export var volume_db: float = 0.0: set = set_volume_db
 ## If true, slightly adjusts audio speed to keep audio/video in sync.
 @export var audio_speed_to_sync: bool = false
+## Loop the video when it reaches the end of its configured playback range.
+@export var loop: bool = false
 ## Playback speed multiplier.
 @export_range(PLAYBACK_SPEED_MIN, PLAYBACK_SPEED_MAX, 0.05, "or_less", "or_greater")
 var playback_speed: float = 1.0: set = set_playback_speed
@@ -106,6 +110,10 @@ var end_position_seconds: float = -1.0: set = set_end_position_seconds
 @export_group("Video")
 ## Force a specific colour profile, or leave AUTO to use the video metadata.
 @export var color_profile: ColorProfile = ColorProfile.AUTO: set = _set_color_profile
+## If true and the GoZen backend supports it, request FFmpeg hardware decoding before opening videos.
+@export var hardware_decoding: bool = true
+## FFmpeg hardware device type to request when hardware decoding is enabled.
+@export var hardware_device_type: String = "drm"
 
 @export_group("Debug")
 ## Print debug information about the system and loaded video.
@@ -167,11 +175,17 @@ var _empty_texture_image: Image = null
 var _syncing_range_properties: bool = false
 var _start_range_prefers_frames: bool = false
 var _end_range_prefers_frames: bool = false
+var _finish_events_sent: bool = false
+var _restart_on_next_show: bool = false
+var _has_presentable_frame: bool = false
 
 var y_texture: ImageTexture
 var u_texture: ImageTexture
 var v_texture: ImageTexture
 var a_texture: ImageTexture
+
+const YUV_LIMITED_BLACK: float = 16.0 / 255.0
+const YUV_NEUTRAL_CHROMA: float = 128.0 / 255.0
 
 func _get_available_audio_bus_names() -> PackedStringArray:
 	var bus_names: PackedStringArray = PackedStringArray()
@@ -295,6 +309,9 @@ func _wait_for_video_task_completion() -> void:
 		printerr("Something went wrong waiting for task completion! %s" % error)
 	_video_thread = -1
 
+func _is_video_task_completed() -> bool:
+	return _video_thread != -1 and WorkerThreadPool.is_task_completed(_video_thread)
+
 func _sync_playback_range_from_seconds(is_start: bool) -> void:
 	if _syncing_range_properties:
 		return
@@ -406,6 +423,7 @@ func _enter_tree() -> void:
 	u_texture = ImageTexture.create_from_image(empty_image)
 	v_texture = ImageTexture.create_from_image(empty_image)
 	a_texture = ImageTexture.create_from_image(empty_image)
+	_clear_video_frame()
 
 	if _shader_material == null:
 		_shader_material = ShaderMaterial.new()
@@ -421,6 +439,7 @@ func _enter_tree() -> void:
 
 	video_texture.material = _shader_material
 	video_texture.texture = ImageTexture.new()
+	video_texture.visible = false
 	video_texture.anchor_left = 0.0
 	video_texture.anchor_top = 0.0
 	video_texture.anchor_right = 1.0
@@ -471,15 +490,31 @@ func _ready() -> void:
 			call_deferred("_refresh_editor_preview")
 		return
 
-	if path != "" and video == null:
-		set_video_path(path)
-
 	video_ended.connect(_on_finished)
 	visibility_changed.connect(_on_visibility)
+
+	if path != "" and video == null:
+		if autoplay and hide_behavior != HideBehavior.CONTINUE:
+			call_deferred("_open_deferred_autoplay_video")
+		else:
+			set_video_path(path)
 
 	if _is_playing and ducking:
 		ducking.calculate_release_time(Time.get_ticks_msec())
 		MPF.media.sound.buses[ducking.target_bus].duck(ducking)
+
+func _open_deferred_autoplay_video() -> void:
+	if path == "" or video != null or _video_thread != -1:
+		return
+	if is_visible_in_tree():
+		set_video_path(path)
+
+func preload_video() -> void:
+	if Engine.is_editor_hint():
+		return
+	if path == "" or video != null or _video_thread != -1:
+		return
+	set_video_path(path)
 
 func _notification(what: int) -> void:
 	if Engine.is_editor_hint() and what == NOTIFICATION_VISIBILITY_CHANGED:
@@ -502,10 +537,18 @@ func _process(delta: float) -> void:
 		_time_elapsed -= _skips * _frame_time
 		current_frame += _skips
 
+		if _should_send_finish_events(playback_end_frame):
+			_send_finish_events()
+
 		if current_frame >= _frame_count or current_frame > playback_end_frame:
 			_is_playing = false
 			if enable_audio and audio_player.stream != null:
 				audio_player.set_stream_paused(true)
+
+			if loop:
+				seek_frame(_get_configured_start_frame())
+				play()
+				return
 
 			video_ended.emit()
 		else:
@@ -521,10 +564,13 @@ func _process(delta: float) -> void:
 					_skips -= 1
 				next_frame()
 	elif _video_thread != -1:
+		if not _is_video_task_completed():
+			return
+
 		_wait_for_video_task_completion()
 		_update_video(video)
 
-		if autoplay:
+		if autoplay and is_visible_in_tree():
 			play()
 
 func _play() -> void:
@@ -544,16 +590,30 @@ func _on_visibility() -> void:
 	match hide_behavior:
 		HideBehavior.RESTART:
 			if do_show:
-				_play()
+				if video == null and _video_thread == -1 and path != "":
+					set_video_path(path)
+				else:
+					if _restart_on_next_show:
+						seek_frame(_get_configured_start_frame())
+						_restart_on_next_show = false
+					_play()
 			else:
-				stop()
+				if hardware_decoding:
+					close()
+					_restart_on_next_show = false
+				else:
+					pause()
+					_restart_on_next_show = true
 
 		HideBehavior.PAUSE:
 			paused = not do_show
 			if log:
 				log.debug("Pause state set to %s", paused)
 			if not paused and not _is_playing:
-				_play()
+				if video == null and _video_thread == -1 and path != "":
+					set_video_path(path)
+				else:
+					_play()
 
 		HideBehavior.CONTINUE:
 			if do_show and not _is_playing:
@@ -572,11 +632,24 @@ func _on_finished() -> void:
 		if parent_node != null and end_method != "" and parent_node.has_method(end_method):
 			parent_node.call(end_method)
 
-	if events_when_stopped:
-		for e in events_when_stopped.split(","):
-			var event_name := e.strip_edges()
-			if event_name != "":
-				MPF.server.send_event(event_name)
+	_send_finish_events()
+
+func _should_send_finish_events(playback_end_frame: int) -> bool:
+	if _finish_events_sent or events_when_stopped == "" or events_when_stopped_lead_time <= 0.0 or _frame_rate <= 0.0:
+		return false
+
+	var lead_frames: int = ceili(events_when_stopped_lead_time * _frame_rate)
+	return current_frame >= playback_end_frame - lead_frames
+
+func _send_finish_events() -> void:
+	if _finish_events_sent or events_when_stopped == "":
+		return
+
+	_finish_events_sent = true
+	for e in events_when_stopped.split(","):
+		var event_name := e.strip_edges()
+		if event_name != "":
+			MPF.server.send_event(event_name)
 
 func _remove_self() -> void:
 	var parent: Node = _get_mpf_parent()
@@ -667,6 +740,9 @@ func _update_video(new_video: GoZenVideo) -> void:
 
 	_is_playing = false
 	current_frame = 0
+	_finish_events_sent = false
+	_restart_on_next_show = false
+	_has_presentable_frame = false
 	_time_elapsed = 0.0
 	_audio_sync_elapsed = 0.0
 
@@ -735,23 +811,34 @@ func _get_audio_playback_position() -> float:
 	return current_frame / _frame_rate
 
 func _clear_video_frame() -> void:
+	_has_presentable_frame = false
+	if video_texture != null:
+		video_texture.visible = false
+
 	if _empty_texture_image == null:
 		_empty_texture_image = Image.create_empty(2, 2, false, Image.FORMAT_R8)
 
-	_empty_texture_image.fill(Color.WHITE)
+	var black_luma_image: Image = Image.create_empty(2, 2, false, Image.FORMAT_R8)
+	var neutral_chroma_image: Image = Image.create_empty(2, 2, false, Image.FORMAT_R8)
+	var opaque_alpha_image: Image = Image.create_empty(2, 2, false, Image.FORMAT_R8)
+
+	black_luma_image.fill(Color(YUV_LIMITED_BLACK, YUV_LIMITED_BLACK, YUV_LIMITED_BLACK, 1.0))
+	neutral_chroma_image.fill(Color(YUV_NEUTRAL_CHROMA, YUV_NEUTRAL_CHROMA, YUV_NEUTRAL_CHROMA, 1.0))
+	opaque_alpha_image.fill(Color.WHITE)
+	_empty_texture_image.fill(Color.BLACK)
 
 	if video_texture != null and video_texture.texture != null:
 		@warning_ignore("UNSAFE_METHOD_ACCESS")
 		video_texture.texture.set_image(_empty_texture_image)
 
 	if y_texture != null:
-		y_texture.set_image(_empty_texture_image)
+		y_texture.set_image(black_luma_image)
 	if u_texture != null:
-		u_texture.set_image(_empty_texture_image)
+		u_texture.set_image(neutral_chroma_image)
 	if v_texture != null:
-		v_texture.set_image(_empty_texture_image)
+		v_texture.set_image(neutral_chroma_image)
 	if a_texture != null:
-		a_texture.set_image(_empty_texture_image)
+		a_texture.set_image(opaque_alpha_image)
 
 func _set_color_profile(new_profile: ColorProfile = color_profile) -> void:
 	if _shader_material == null:
@@ -784,10 +871,17 @@ func seek_frame(new_frame_nr: int) -> void:
 		return
 
 	var max_frame_index: int = maxi(_frame_count - 1, 0)
-	current_frame = clamp(new_frame_nr, 0, max_frame_index)
-	if video.seek_frame(current_frame):
+	var requested_frame: int = clamp(new_frame_nr, 0, max_frame_index)
+	current_frame = requested_frame
+	if current_frame <= _get_configured_start_frame():
+		_finish_events_sent = false
+	if video.seek_frame(requested_frame):
 		printerr("Couldn't seek frame!")
 	else:
+		current_frame = video.get_current_frame()
+		if current_frame < requested_frame and requested_frame >= max_frame_index:
+			_frame_count = maxi(current_frame + 1, 1)
+			notify_property_list_changed()
 		_set_frame_image()
 
 	if (
@@ -816,6 +910,8 @@ func close() -> void:
 	video = null
 	audio_player.stream = null
 	current_frame = 0
+	_finish_events_sent = false
+	_restart_on_next_show = false
 	_time_elapsed = 0.0
 	_audio_sync_elapsed = 0.0
 	_frame_time = 0.0
@@ -865,6 +961,8 @@ func play() -> void:
 	var playback_end_frame: int = _get_effective_runtime_end_frame()
 	if current_frame < playback_start_frame or current_frame > playback_end_frame:
 		seek_frame(playback_start_frame)
+	if current_frame <= playback_start_frame:
+		_finish_events_sent = false
 
 	_is_playing = true
 	_audio_sync_elapsed = 0.0
@@ -981,6 +1079,9 @@ func _set_frame_image() -> void:
 	RenderingServer.texture_2d_update(v_texture.get_rid(), video.get_v_data(), 0)
 	if _has_alpha and a_texture != null:
 		RenderingServer.texture_2d_update(a_texture.get_rid(), video.get_a_data(), 0)
+	_has_presentable_frame = true
+	if video_texture != null:
+		video_texture.visible = true
 
 func set_playback_speed(new_playback_value: float) -> void:
 	playback_speed = clampf(new_playback_value, PLAYBACK_SPEED_MIN, PLAYBACK_SPEED_MAX)
@@ -1036,7 +1137,18 @@ func duration_to_formatted_string(duration_in_seconds: float) -> String:
 		return "%02d:%02d" % [minutes, seconds]
 	return "%02d:%02d:%02d" % [hours, minutes, seconds]
 
+func _configure_video_decoder(video_instance: GoZenVideo) -> void:
+	if video_instance == null:
+		return
+	if not hardware_decoding:
+		return
+	if video_instance.has_method("set_hardware_decoding"):
+		video_instance.set_hardware_decoding(true)
+	if video_instance.has_method("set_hardware_device_type"):
+		video_instance.set_hardware_device_type(hardware_device_type)
+
 func _open_video(video_instance: GoZenVideo, video_path: String) -> void:
+	_configure_video_decoder(video_instance)
 	if video_instance.open(video_path):
 		printerr("Error opening video!")
 
@@ -1073,6 +1185,7 @@ func _ensure_editor_preview_video() -> bool:
 		else:
 			video.disable_debug()
 
+		_configure_video_decoder(video)
 		if video.open(path):
 			printerr("Error opening video in editor preview!")
 			video = null

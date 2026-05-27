@@ -112,7 +112,7 @@ func _on_text_input_event(payload):
 func _on_select():
 	var selection = self.get_child(selected_index)
 	var new_text = String(current_text)
-	match selection.text:
+	match selection.text.to_upper():
 		"SPACE":
 			new_text += " "
 		"DEL":
