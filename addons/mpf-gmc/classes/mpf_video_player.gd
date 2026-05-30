@@ -540,7 +540,9 @@ func _process(delta: float) -> void:
 		if _should_send_finish_events(playback_end_frame):
 			_send_finish_events()
 
-		if current_frame >= _frame_count or current_frame > playback_end_frame:
+		var eof_reached: bool = current_frame >= _frame_count or current_frame > playback_end_frame
+
+		if eof_reached:
 			_is_playing = false
 			if enable_audio and audio_player.stream != null:
 				audio_player.set_stream_paused(true)
@@ -551,18 +553,33 @@ func _process(delta: float) -> void:
 				return
 
 			video_ended.emit()
-		else:
-			if enable_audio and audio_player.stream != null and _audio_sync_elapsed >= AUDIO_SYNC_INTERVAL:
-				_sync_audio_video()
-				_audio_sync_elapsed = 0.0
+			return
+		if enable_audio and audio_player.stream != null and _audio_sync_elapsed >= AUDIO_SYNC_INTERVAL:
+			_sync_audio_video()
+			_audio_sync_elapsed = 0.0
 
-			if _skips > _frame_rate:
-				seek_frame(current_frame)
+		if _skips > _frame_rate:
+			seek_frame(current_frame)
+		else:
+			while _skips != 1:
+				if not next_frame(true):
+					eof_reached = true
+					break
+				_skips -= 1
+			if not eof_reached and not next_frame():
+				eof_reached = true
+
+		if eof_reached:
+			_is_playing = false
+			if enable_audio and audio_player.stream != null:
+				audio_player.set_stream_paused(true)
+
+			if loop:
+				seek_frame(_get_configured_start_frame())
+				play()
+				return
 			else:
-				while _skips != 1:
-					next_frame(true)
-					_skips -= 1
-				next_frame()
+				video_ended.emit()
 	elif _video_thread != -1:
 		if not _is_video_task_completed():
 			return
@@ -896,12 +913,16 @@ func seek_frame(new_frame_nr: int) -> void:
 		audio_player.set_stream_paused(not _is_playing)
 		_audio_sync_elapsed = 0.0
 
-func next_frame(skip: bool = false) -> void:
-	if video.next_frame(skip) and not skip:
-		_set_frame_image()
-		next_frame_called.emit(current_frame)
+func next_frame(skip: bool = false) -> bool:
+	var frame_advanced: bool = video.next_frame(skip)
+	if frame_advanced:
+		if not skip:
+			_set_frame_image()
+			next_frame_called.emit(current_frame)
+		return true
 	elif not skip:
 		print("Something went wrong getting next frame!")
+	return false
 
 func close() -> void:
 	if _is_playing:
