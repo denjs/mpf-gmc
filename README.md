@@ -24,6 +24,15 @@ With the Godot MC, pinball creators using MPF can choose Godot as their display 
 
 # Installation & Documentation
 
+## Luma video integration in this fork
+
+The `codex/luma-video-integration` branch uses
+[Luma Video](https://github.com/denjs/luma-video) for `MPFVideoPlayer`.
+Install/build `addons/luma_video` alongside GMC before opening or exporting a
+project. MPF slide, playback and BCP interfaces are preserved. The legacy GoZen
+extension descriptor is disabled; no GoZen installation or FFmpeg runtime is
+required. See Luma's `integrations/gmc` notes for supported builds and setup.
+
 Full installation guides and documentation are available at https://missionpinball.org/gmc/
 
 # Contributing

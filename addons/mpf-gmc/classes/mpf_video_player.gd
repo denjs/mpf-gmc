@@ -2,7 +2,7 @@
 class_name MPFVideoPlayer
 extends Control
 ## Renders a video player with options for end behaviour and events.
-## Uses the GoZen native backend directly while preserving the MPF-facing API.
+## Uses the Luma native backend directly while preserving the MPF-facing API.
 
 enum HideBehavior {
 	## Stop playback when hidden and restart when visible
@@ -48,7 +48,7 @@ signal playback_started
 signal playback_paused
 signal playback_ready
 
-const SHADER_PATH: String = "res://addons/mpf-gmc/yuv_to_rgb.gdshader"
+const SHADER_PATH: String = "res://addons/luma_video/yuv_to_rgb.gdshader"
 const PLAYBACK_SPEED_MIN: float = 0.25
 const PLAYBACK_SPEED_MAX: float = 4.0
 const AUDIO_OFFSET_THRESHOLD: float = 0.1
@@ -110,10 +110,10 @@ var end_position_seconds: float = -1.0: set = set_end_position_seconds
 @export_group("Video")
 ## Force a specific colour profile, or leave AUTO to use the video metadata.
 @export var color_profile: ColorProfile = ColorProfile.AUTO: set = _set_color_profile
-## If true and the GoZen backend supports it, request FFmpeg hardware decoding before opening videos.
+## Request Luma hardware decoding before opening videos, with platform fallback.
 @export var hardware_decoding: bool = true
-## FFmpeg hardware device type to request when hardware decoding is enabled.
-@export var hardware_device_type: String = "drm"
+## Choose the platform's available decoder, or request an explicit FFmpeg hardware backend.
+@export var hardware_device_type: String = "auto"
 
 @export_group("Debug")
 ## Print debug information about the system and loaded video.
@@ -139,7 +139,7 @@ var paused: bool = false:
 @warning_ignore("shadowed_global_identifier")
 var log: GMCLogger
 
-var video: GoZenVideo = null
+var video: LumaVideoDecoder = null
 
 var video_texture: TextureRect = TextureRect.new()
 var audio_player: AudioStreamPlayer = AudioStreamPlayer.new()
@@ -723,7 +723,7 @@ func set_video_path(new_path: String) -> void:
 			call_deferred("_refresh_editor_preview")
 		return
 
-	video = GoZenVideo.new()
+	video = LumaVideoDecoder.new()
 	if debug:
 		video.enable_debug()
 	else:
@@ -734,7 +734,7 @@ func set_video_path(new_path: String) -> void:
 	if enable_audio:
 		_open_audio()
 
-func update_video(video_instance: GoZenVideo, audio_stream: AudioStreamWAV = null) -> void:
+func update_video(video_instance: LumaVideoDecoder, audio_stream: AudioStreamWAV = null) -> void:
 	if video != null:
 		close()
 
@@ -746,7 +746,7 @@ func update_video(video_instance: GoZenVideo, audio_stream: AudioStreamWAV = nul
 	else:
 		_open_audio()
 
-func _update_video(new_video: GoZenVideo) -> void:
+func _update_video(new_video: LumaVideoDecoder) -> void:
 	video = new_video
 	if not is_open():
 		printerr("Video isn't open!")
@@ -1158,26 +1158,22 @@ func duration_to_formatted_string(duration_in_seconds: float) -> String:
 		return "%02d:%02d" % [minutes, seconds]
 	return "%02d:%02d:%02d" % [hours, minutes, seconds]
 
-func _configure_video_decoder(video_instance: GoZenVideo) -> void:
+func _configure_video_decoder(video_instance: LumaVideoDecoder) -> void:
 	if video_instance == null:
 		return
-	if not hardware_decoding:
-		return
-	if video_instance.has_method("set_hardware_decoding"):
-		video_instance.set_hardware_decoding(true)
-	if video_instance.has_method("set_hardware_device_type"):
-		video_instance.set_hardware_device_type(hardware_device_type)
+	video_instance.set_hardware_decoding(hardware_decoding)
+	video_instance.set_hardware_device_type(hardware_device_type)
 
-func _open_video(video_instance: GoZenVideo, video_path: String) -> void:
+func _open_video(video_instance: LumaVideoDecoder, video_path: String) -> void:
 	_configure_video_decoder(video_instance)
 	if video_instance.open(video_path):
 		printerr("Error opening video!")
 
 func _open_audio(stream_id: int = -1) -> void:
-	var stream: AudioStreamFFmpeg = AudioStreamFFmpeg.new()
+	var stream: LumaAudioStream = LumaAudioStream.new()
 
 	if stream.open(path, stream_id) != OK:
-		printerr("Failed to open AudioStreamFFmpeg for: %s" % path)
+		printerr("Failed to open LumaAudioStream for: %s" % path)
 		return
 
 	audio_player.stream = stream
@@ -1200,7 +1196,7 @@ func _ensure_editor_preview_video() -> bool:
 		return false
 
 	if video == null:
-		video = GoZenVideo.new()
+		video = LumaVideoDecoder.new()
 		if debug:
 			video.enable_debug()
 		else:
