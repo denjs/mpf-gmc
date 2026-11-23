@@ -141,8 +141,8 @@ var log: GMCLogger
 
 var video: LumaVideoDecoder = null
 
-var video_texture: TextureRect = TextureRect.new()
-var audio_player: AudioStreamPlayer = AudioStreamPlayer.new()
+var video_texture: TextureRect
+var audio_player: AudioStreamPlayer
 
 var _is_playing: bool = false
 var current_frame: int = 0: set = _set_current_frame
@@ -438,7 +438,7 @@ func _enter_tree() -> void:
 		add_child(video_texture)
 
 	video_texture.material = _shader_material
-	video_texture.texture = ImageTexture.new()
+	video_texture.texture = ImageTexture.create_from_image(empty_image)
 	video_texture.visible = false
 	video_texture.anchor_left = 0.0
 	video_texture.anchor_top = 0.0
@@ -475,9 +475,7 @@ func _enter_tree() -> void:
 		stop()
 
 func _exit_tree() -> void:
-	_wait_for_video_task_completion()
-
-	if video != null:
+	if video != null or _video_thread != -1:
 		close()
 
 	_release_created_audio_bus()
@@ -490,8 +488,10 @@ func _ready() -> void:
 			call_deferred("_refresh_editor_preview")
 		return
 
-	video_ended.connect(_on_finished)
-	visibility_changed.connect(_on_visibility)
+	if not video_ended.is_connected(_on_finished):
+		video_ended.connect(_on_finished)
+	if not visibility_changed.is_connected(_on_visibility):
+		visibility_changed.connect(_on_visibility)
 
 	if path != "" and video == null:
 		if autoplay and hide_behavior != HideBehavior.CONTINUE:
@@ -536,9 +536,13 @@ func _process(delta: float) -> void:
 
 		_time_elapsed -= _skips * _frame_time
 		current_frame += _skips
+		if not _is_playing or not is_open():
+			return
 
 		if _should_send_finish_events(playback_end_frame):
 			_send_finish_events()
+			if not _is_playing or not is_open():
+				return
 
 		var eof_reached: bool = current_frame >= _frame_count or current_frame > playback_end_frame
 
@@ -585,6 +589,9 @@ func _process(delta: float) -> void:
 			return
 
 		_wait_for_video_task_completion()
+		if not is_open():
+			close()
+			return
 		_update_video(video)
 
 		if autoplay and is_visible_in_tree():
@@ -659,7 +666,7 @@ func _should_send_finish_events(playback_end_frame: int) -> bool:
 	return current_frame >= playback_end_frame - lead_frames
 
 func _send_finish_events() -> void:
-	if _finish_events_sent or events_when_stopped == "":
+	if _finish_events_sent or events_when_stopped == "" or not is_instance_valid(MPF.server):
 		return
 
 	_finish_events_sent = true
@@ -696,9 +703,7 @@ func _get_mpf_parent() -> Node:
 	return null
 
 func set_video_path(new_path: String) -> void:
-	_wait_for_video_task_completion()
-
-	if video != null:
+	if video != null or _video_thread != -1:
 		close()
 
 	if not is_node_ready():
@@ -729,6 +734,7 @@ func set_video_path(new_path: String) -> void:
 	else:
 		video.disable_debug()
 
+	_configure_video_decoder(video)
 	_video_thread = WorkerThreadPool.add_task(_open_video.bind(video, path))
 
 	if enable_audio:
@@ -752,11 +758,10 @@ func _update_video(new_video: LumaVideoDecoder) -> void:
 		printerr("Video isn't open!")
 		return
 
-	var image: Image
 	var rotation_radians: float = deg_to_rad(video.get_rotation())
 
 	_is_playing = false
-	current_frame = 0
+	current_frame = video.get_current_frame()
 	_finish_events_sent = false
 	_restart_on_next_show = false
 	_has_presentable_frame = false
@@ -785,13 +790,6 @@ func _update_video(new_video: LumaVideoDecoder) -> void:
 		)
 		chapters.append(chapter)
 
-	if abs(_rotation) == 90:
-		image = Image.create_empty(_resolution.y, _resolution.x, false, Image.FORMAT_R8)
-	else:
-		image = Image.create_empty(_resolution.x, _resolution.y, false, Image.FORMAT_R8)
-
-	image.fill(Color.WHITE)
-
 	if debug:
 		_print_video_debug()
 
@@ -799,10 +797,11 @@ func _update_video(new_video: LumaVideoDecoder) -> void:
 		return
 
 	@warning_ignore("UNSAFE_METHOD_ACCESS")
-	video_texture.texture.set_image(image)
+	video_texture.texture.set_size_override(Vector2i(_resolution.y, _resolution.x) if abs(_rotation) == 90 else _resolution)
 
 	_shader_material.set_shader_parameter("resolution", video.get_actual_resolution())
 	_shader_material.set_shader_parameter("full_color", video.is_full_color_range())
+	_shader_material.set_shader_parameter("has_alpha", _has_alpha)
 	_shader_material.set_shader_parameter("interlaced", video.get_interlaced())
 	_shader_material.set_shader_parameter("rotation", rotation_radians)
 	_set_color_profile()
@@ -810,7 +809,8 @@ func _update_video(new_video: LumaVideoDecoder) -> void:
 	y_texture.set_image(video.get_y_data())
 	u_texture.set_image(video.get_u_data())
 	v_texture.set_image(video.get_v_data())
-	a_texture.set_image(video.get_a_data() if _has_alpha else image)
+	if _has_alpha:
+		a_texture.set_image(video.get_a_data())
 
 	_shader_material.set_shader_parameter("y_data", y_texture)
 	_shader_material.set_shader_parameter("u_data", u_texture)
@@ -818,8 +818,12 @@ func _update_video(new_video: LumaVideoDecoder) -> void:
 	_shader_material.set_shader_parameter("a_data", a_texture)
 
 	set_playback_speed(playback_speed)
-	if _frame_count > 0:
-		seek_frame(_get_configured_start_frame())
+	var start_frame := _get_configured_start_frame()
+	if _frame_count > 0 and start_frame != current_frame:
+		seek_frame(start_frame)
+	else:
+		_has_presentable_frame = true
+		video_texture.visible = true
 	video_loaded.emit()
 
 func _get_audio_playback_position() -> float:
@@ -884,22 +888,22 @@ func _set_color_profile(new_profile: ColorProfile = color_profile) -> void:
 	_shader_material.set_shader_parameter("color_profile", color_data)
 
 func seek_frame(new_frame_nr: int) -> void:
-	if not is_open() and new_frame_nr == current_frame:
+	if not is_open():
 		return
 
 	var max_frame_index: int = maxi(_frame_count - 1, 0)
 	var requested_frame: int = clamp(new_frame_nr, 0, max_frame_index)
-	current_frame = requested_frame
-	if current_frame <= _get_configured_start_frame():
-		_finish_events_sent = false
 	if video.seek_frame(requested_frame):
 		printerr("Couldn't seek frame!")
-	else:
-		current_frame = video.get_current_frame()
-		if current_frame < requested_frame and requested_frame >= max_frame_index:
-			_frame_count = maxi(current_frame + 1, 1)
-			notify_property_list_changed()
-		_set_frame_image()
+		return
+
+	current_frame = video.get_current_frame()
+	if current_frame <= _get_configured_start_frame():
+		_finish_events_sent = false
+	if current_frame < requested_frame and requested_frame >= max_frame_index:
+		_frame_count = maxi(current_frame + 1, 1)
+		notify_property_list_changed()
+	_set_frame_image()
 
 	if (
 		enable_audio
@@ -914,6 +918,8 @@ func seek_frame(new_frame_nr: int) -> void:
 		_audio_sync_elapsed = 0.0
 
 func next_frame(skip: bool = false) -> bool:
+	if not is_open():
+		return false
 	var frame_advanced: bool = video.next_frame(skip)
 	if frame_advanced:
 		if not skip:
@@ -925,11 +931,14 @@ func next_frame(skip: bool = false) -> bool:
 	return false
 
 func close() -> void:
+	_wait_for_video_task_completion()
 	if _is_playing:
 		pause()
 
 	video = null
-	audio_player.stream = null
+	if is_instance_valid(audio_player):
+		audio_player.stop()
+		audio_player.stream = null
 	current_frame = 0
 	_finish_events_sent = false
 	_restart_on_next_show = false
@@ -998,7 +1007,7 @@ func play() -> void:
 func pause() -> void:
 	_is_playing = false
 	_audio_sync_elapsed = 0.0
-	if enable_audio and audio_player.stream != null:
+	if enable_audio and is_instance_valid(audio_player) and audio_player.stream != null:
 		audio_player.set_stream_paused(true)
 	playback_paused.emit()
 
@@ -1085,7 +1094,7 @@ func get_stream_language(stream: int) -> String:
 	return video.get_stream_metadata(stream).get("language")
 
 func is_open() -> bool:
-	return video != null and video.is_open()
+	return _video_thread == -1 and video != null and video.is_open()
 
 func _set_current_frame(new_current_frame: int) -> void:
 	current_frame = new_current_frame
@@ -1165,7 +1174,6 @@ func _configure_video_decoder(video_instance: LumaVideoDecoder) -> void:
 	video_instance.set_hardware_device_type(hardware_device_type)
 
 func _open_video(video_instance: LumaVideoDecoder, video_path: String) -> void:
-	_configure_video_decoder(video_instance)
 	if video_instance.open(video_path):
 		printerr("Error opening video!")
 
